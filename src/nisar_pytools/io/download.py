@@ -1,28 +1,26 @@
-"""Download NISAR products from ASF with parallel support and validation."""
+"""Download NISAR products with persistent HTTP resumption and validation."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
-import tempfile
-import threading
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 import h5py
 import requests
 
 log = logging.getLogger(__name__)
 
-# Thread-local storage for per-thread sessions
-_thread_local = threading.local()
-
 
 def _url_filename(url: str) -> str:
     """Extract the filename from a URL, stripping query strings."""
-    return urlparse(url).path.rsplit("/", 1)[-1]
+    return urlsplit(url).path.rsplit("/", 1)[-1]
 
 
 def validate_h5_quick(filepath: Path) -> bool:
@@ -71,12 +69,75 @@ def validate_h5_thorough(filepath: Path) -> bool:
                 grids_path = f"science/{band}/{product_type}/{data_group}"
                 if grids_path in f:
                     _ = list(f[grids_path].keys())
-                    break
+                    return True
 
-        return True
+            log.warning("Missing product data group: %s", filepath.name)
+        return False
     except Exception as e:
         log.warning("Validation failed for %s: %s", filepath.name, e)
         return False
+
+
+class _DownloadError(Exception):
+    """A safe-to-log transfer error (never includes a URL or credentials)."""
+
+
+class _RestartDownload(_DownloadError):
+    """The partial file cannot safely be reused."""
+
+
+def _source_id(url: str) -> str:
+    """Identify the original endpoint without retaining credentials/signed queries."""
+    parts = urlsplit(url)
+    endpoint = f"{parts.scheme}://{parts.hostname}:{parts.port}{parts.path}"
+    return hashlib.sha256(endpoint.encode()).hexdigest()
+
+
+def _read_metadata(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _write_metadata(path: Path, data: dict) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(json.dumps(data))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _file_identity(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"device": stat.st_dev, "inode": stat.st_ino, "mtime_ns": stat.st_mtime_ns}
+
+
+def _validator(metadata: dict) -> str | None:
+    etag = metadata.get("etag")
+    if isinstance(etag, str) and etag.startswith('"') and etag.endswith('"'):
+        return etag  # Weak ETags cannot be used with If-Range.
+    return metadata.get("last_modified") or None
+
+
+def _validator_matches(metadata: dict, response: requests.Response, *, required=False) -> bool:
+    """If-Range protects 206s; a 416 needs explicit identity confirmation."""
+    key = "ETag" if _validator(metadata) == metadata.get("etag") else "Last-Modified"
+    current = response.headers.get(key)
+    return current == _validator(metadata) if current or required else True
+
+
+def _content_length(response: requests.Response) -> int | None:
+    value = response.headers.get("Content-Length")
+    if value is None:
+        return None
+    if not value.isdigit():
+        raise _RestartDownload("Invalid Content-Length")
+    return int(value)
 
 
 def download_urls(
@@ -88,174 +149,214 @@ def download_urls(
     timeout: int = 60,
     validate: bool = True,
 ) -> list[Path]:
-    """Download files from a list of URLs in parallel with validation.
+    """Download in parallel, resuming interrupted transfers across calls.
 
-    Uses connection pooling and multithreading for fast downloads.
-    Skips files that already exist (unless ``reprocess=True``).
-    Optionally validates downloaded HDF5 files and retries corrupted ones.
+    Transfers use persistent ``<filename>.part`` and ``.part.json`` files.
+    Range requests require a strong ETag or Last-Modified validator; otherwise
+    a partial download restarts safely. Servers ignoring Range also restart.
+    Known total length and optional NISAR HDF5 validation are checked before
+    atomic publication. ``.download.json`` records the completed file's length
+    and filesystem identity.
 
-    Downloads are written to a temporary file first and renamed atomically
-    on success, preventing partial/corrupt files from being left on disk.
+    Existing files are checked against saved length metadata and, when
+    ``validate=True`` (default), NISAR HDF5 structure. Legacy files without
+    metadata retain the existing-file behavior, with HDF5 validation enabled.
+    ``reprocess=True`` starts a fresh transfer. ``retries`` is the maximum
+    number of attempts per URL; failed files are excluded from the returned,
+    alphabetically sorted paths. INFO logging reports progress every 30 seconds.
 
-    Parameters
-    ----------
-    urls : list of str
-        Download URLs (typically from :func:`find_nisar`).
-    out_directory : str or Path
-        Directory to save files to. Created if it does not exist.
-    reprocess : bool
-        If ``True``, re-download files even if they already exist.
-    max_workers : int
-        Number of parallel download threads. Default 4.
-    retries : int
-        Number of retry attempts per URL on failure. Default 3.
-    timeout : int
-        Request timeout in seconds. Default 60.
-    validate : bool
-        If ``True`` (default), validate downloaded ``.h5`` files and retry
-        corrupted ones.
-
-    Returns
-    -------
-    list of Path
-        Paths to successfully downloaded files, sorted alphabetically.
-        Files that fail after all retries are excluded (with a warning logged).
+    Do not run concurrent calls targeting the same filenames/directory.
     """
+    if retries < 1 or max_workers < 1:
+        raise ValueError("retries and max_workers must be positive")
     out_directory = Path(out_directory)
     out_directory.mkdir(parents=True, exist_ok=True)
 
-    # Build URL → filename mapping, skipping URLs that collide on filename
     url_to_filename: dict[str, str] = {}
-    seen_filenames: dict[str, str] = {}
+    seen_filenames: set[str] = set()
     for url in urls:
         fname = _url_filename(url)
+        if not fname or fname in {".", ".."} or "\\" in fname or any(ord(c) < 32 for c in fname):
+            raise ValueError("Download URL has an invalid filename")
         if fname in seen_filenames:
-            log.warning(
-                "Duplicate filename '%s' — keeping:\n  %s\n  skipping:\n  %s",
-                fname, seen_filenames[fname], url,
-            )
+            log.warning("Duplicate filename %s: keeping the first URL", fname)
             continue
-        seen_filenames[fname] = url
+        seen_filenames.add(fname)
         url_to_filename[url] = fname
-
-    def _get_session() -> requests.Session:
-        """Get a thread-local requests session."""
-        if not hasattr(_thread_local, "session"):
-            session = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(
-                pool_connections=2,
-                pool_maxsize=2,
-            )
-            session.mount("https://", adapter)
-            session.mount("http://", adapter)
-            _thread_local.session = session
-        return _thread_local.session
 
     def _download_one(url: str) -> Path | None:
         out_fp = out_directory / url_to_filename[url]
+        part = out_fp.with_name(out_fp.name + ".part")
+        part_meta = out_fp.with_name(out_fp.name + ".part.json")
+        done_meta = out_fp.with_name(out_fp.name + ".download.json")
+        source = _source_id(url)
 
-        if out_fp.exists() and out_fp.stat().st_size > 0 and not reprocess:
-            log.debug("Skipping (exists): %s", out_fp.name)
+        def valid_h5(path: Path) -> bool:
+            return not (validate and out_fp.suffix.lower() == ".h5") or validate_h5_thorough(path)
+
+        def reset_partial() -> None:
+            part.unlink(missing_ok=True)
+            part_meta.unlink(missing_ok=True)
+
+        def publish(metadata: dict) -> Path:
+            total = metadata.get("total")
+            if not isinstance(total, int) or total < 0:
+                raise _DownloadError("No trustworthy total length; partial file retained")
+            if part.stat().st_size != total:
+                raise _DownloadError("Incomplete transfer; partial file retained")
+            if not valid_h5(part):
+                raise _RestartDownload("Downloaded HDF5 failed validation")
+            # Bind the record to this inode before rename: a crash between the
+            # two replacements must not pair new metadata with an old final file,
+            # even when both files have the same length. Rename preserves identity.
+            _write_metadata(done_meta, {**metadata, "file_identity": _file_identity(part)})
+            os.replace(part, out_fp)
+            part_meta.unlink(missing_ok=True)
+            log.info("Downloaded %s (%d bytes)", out_fp.name, total)
             return out_fp
 
-        session = _get_session()
-
-        for attempt in range(retries):
-            # Write to temp file, rename on success (atomic)
-            tmp_fd = None
-            tmp_path = None
-            try:
-                tmp_fd, tmp_path = tempfile.mkstemp(
-                    dir=out_directory, suffix=".tmp"
-                )
-                r = session.get(url, stream=True, timeout=timeout)
-                r.raise_for_status()
-                with os.fdopen(tmp_fd, "wb") as f:
-                    tmp_fd = None  # fdopen takes ownership
-                    for chunk in r.iter_content(chunk_size=256 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                # Atomic rename
-                os.replace(tmp_path, out_fp)
-                tmp_path = None
-                log.debug("Downloaded: %s", out_fp.name)
+        if out_fp.exists() and out_fp.stat().st_size > 0 and not reprocess:
+            completed = _read_metadata(done_meta)
+            size_ok = not completed or (
+                completed.get("source") == source
+                and completed.get("total") == out_fp.stat().st_size
+            )
+            identity_ok = "file_identity" not in completed or (
+                completed["file_identity"] == _file_identity(out_fp)
+            )
+            if size_ok and identity_ok and valid_h5(out_fp):
+                log.info("Verified existing file: %s", out_fp.name)
                 return out_fp
-            except Exception:
-                if attempt == retries - 1:
-                    log.error("Failed after %d retries: %s", retries, url)
-                    return None
-                log.warning("Retry %d for %s", attempt + 1, url)
-                time.sleep(1.5)
-            finally:
-                # Clean up temp file on failure
-                if tmp_fd is not None:
-                    os.close(tmp_fd)
-                if tmp_path is not None and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+            log.warning("Existing file failed checks; downloading again: %s", out_fp.name)
+        if reprocess:
+            reset_partial()
 
+        with requests.Session() as session:
+            for attempt in range(retries):
+                try:
+                    metadata = _read_metadata(part_meta)
+                    offset = part.stat().st_size if part.exists() else 0
+                    total = metadata.get("total")
+                    if offset and (
+                        metadata.get("source") != source
+                        or not _validator(metadata)
+                        or (isinstance(total, int) and offset > total)
+                    ):
+                        reset_partial()
+                        offset = 0
+                    headers = {"Accept-Encoding": "identity"}
+                    if offset:
+                        headers["Range"] = f"bytes={offset}-"
+                        headers["If-Range"] = _validator(metadata)
+                        log.info("Resuming %s at byte %d", out_fp.name, offset)
+                    else:
+                        log.info("Starting download: %s", out_fp.name)
+
+                    response = session.get(url, headers=headers, stream=True, timeout=timeout)
+                    with response:
+                        if response.status_code == 416:
+                            match = re.fullmatch(
+                                r"bytes \*/(\d+)", response.headers.get("Content-Range", ""),
+                            )
+                            if (
+                                offset and match and int(match[1]) == offset
+                                and total in (None, offset)
+                                and _validator_matches(metadata, response, required=True)
+                            ):
+                                metadata["total"] = offset
+                                return publish(metadata)
+                            raise _RestartDownload("Range rejected; restarting transfer")
+                        response.raise_for_status()
+                        encoding = response.headers.get("Content-Encoding", "identity").lower()
+                        if encoding != "identity":
+                            raise _RestartDownload("Unexpected encoded response")
+                        length = _content_length(response)
+                        if response.status_code == 206:
+                            match = re.fullmatch(
+                                r"bytes (\d+)-(\d+)/(\d+)",
+                                response.headers.get("Content-Range", ""),
+                            )
+                            if not offset or not match:
+                                raise _RestartDownload("Unexpected or invalid Content-Range")
+                            start, end, new_total = map(int, match.groups())
+                            if (
+                                start != offset or not start <= end < new_total
+                                or (length is not None and length != end - start + 1)
+                                or (total is not None and total != new_total)
+                                or not _validator_matches(metadata, response)
+                            ):
+                                raise _RestartDownload("Range or resource identity changed")
+                            expected = end - start + 1
+                            metadata["total"] = new_total
+                        elif response.status_code == 200:
+                            if offset:
+                                log.info(
+                                    "Server returned full response; restarting %s", out_fp.name,
+                                )
+                            offset = 0
+                            expected = length
+                            metadata = {
+                                "source": source,
+                                "total": length,
+                                "etag": response.headers.get("ETag"),
+                                "last_modified": response.headers.get("Last-Modified"),
+                            }
+                        else:
+                            raise _RestartDownload("Unexpected success status")
+
+                        # Truncate before replacing metadata on a fresh response,
+                        # so an interruption cannot attach new metadata to old bytes.
+                        with part.open("ab" if offset else "wb") as output:
+                            _write_metadata(part_meta, metadata)
+                            received = 0
+                            last_report = time.monotonic()
+                            for chunk in response.iter_content(chunk_size=256 * 1024):
+                                if not chunk:
+                                    continue
+                                if expected is not None and received + len(chunk) > expected:
+                                    raise _RestartDownload("Response exceeds advertised length")
+                                output.write(chunk)
+                                received += len(chunk)
+                                now = time.monotonic()
+                                if now - last_report >= 30:
+                                    log.info(
+                                        "%s: %d / %s bytes", out_fp.name,
+                                        offset + received, metadata.get("total") or "unknown",
+                                    )
+                                    last_report = now
+                            output.flush()
+                            os.fsync(output.fileno())
+                        if expected is not None and received != expected:
+                            raise _DownloadError(
+                                "Response shorter than advertised; partial retained"
+                            )
+                        return publish(metadata)
+                except Exception as exc:
+                    if isinstance(exc, _RestartDownload):
+                        reset_partial()
+                    # requests errors can contain signed redirect URLs/passwords.
+                    reason = str(exc) if isinstance(exc, _DownloadError) else type(exc).__name__
+                    log.warning(
+                        "Attempt %d/%d failed for %s: %s",
+                        attempt + 1, retries, out_fp.name, reason,
+                    )
+                    if attempt + 1 < retries:
+                        time.sleep(1.5)
         return None
 
-    # Download all files, catching individual failures
-    download_fps: list[Path] = []
-    failed_urls: list[str] = []
+    downloaded: list[Path] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_download_one, url): url for url in url_to_filename}
+        futures = {
+            executor.submit(_download_one, url): name for url, name in url_to_filename.items()
+        }
         for future in as_completed(futures):
-            url = futures[future]
             try:
                 result = future.result()
                 if result is not None:
-                    download_fps.append(result)
-                else:
-                    failed_urls.append(url)
-            except Exception as e:
-                log.error("Download failed for %s: %s", url, e)
-                failed_urls.append(url)
-
-    if failed_urls:
-        log.warning("%d downloads failed: %s", len(failed_urls), failed_urls)
-
-    # Post-download validation
-    if validate:
-        corrupted: list[Path] = []
-        for fp in download_fps:
-            if fp.suffix.lower() == ".h5" and not validate_h5_thorough(fp):
-                corrupted.append(fp)
-
-        if corrupted:
-            log.warning("Found %d corrupted files, retrying...", len(corrupted))
-
-            # Build set for O(1) lookup
-            corrupted_set = set(corrupted)
-            download_fps = [fp for fp in download_fps if fp not in corrupted_set]
-
-            # Find URLs for corrupted files
-            filename_to_url = {fname: url for url, fname in url_to_filename.items()}
-            corrupted_urls = [
-                filename_to_url[fp.name]
-                for fp in corrupted
-                if fp.name in filename_to_url
-            ]
-
-            # Remove corrupted files from disk
-            for fp in corrupted:
-                if fp.exists():
-                    os.remove(fp)
-
-            # Retry corrupted
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(_download_one, url): url
-                    for url in corrupted_urls
-                }
-                for future in as_completed(futures):
-                    try:
-                        retry_fp = future.result()
-                        if retry_fp is not None and validate_h5_thorough(retry_fp):
-                            download_fps.append(retry_fp)
-                        elif retry_fp is not None:
-                            log.warning("Still corrupted after retry: %s", retry_fp.name)
-                    except Exception as e:
-                        log.warning("Retry failed: %s", e)
-
-    return sorted(download_fps)
+                    downloaded.append(result)
+            except Exception as exc:
+                log.error("Download failed for %s: %s", futures[future], type(exc).__name__)
+    failed = len(url_to_filename) - len(downloaded)
+    if failed:
+        log.warning("%d downloads failed; rerun to resume retained partial files", failed)
+    return sorted(downloaded)

@@ -290,9 +290,36 @@ track_77 = find_nisar(
     direction="ASCENDING",
 )
 
-# Download in parallel with automatic HDF5 validation
+# Download in parallel with automatic resumption and HDF5 validation
 fps = download_urls(track_77, "local/gslcs/")
 ```
+
+Interrupted downloads remain as `<filename>.part` with a `.part.json` sidecar.
+Run the same call again to resume, including after restarting Python. The server
+must support HTTP Range and provide a strong ETag or Last-Modified validator;
+otherwise the file restarts safely. A server that ignores Range also triggers a
+fresh download. Do not run two download calls into the same files simultaneously.
+
+The final filename appears only after checking the advertised total length and
+NISAR HDF5 structure. A `.download.json` sidecar records the completed length and
+filesystem identity for later checks. This also prevents an interrupted final
+rename from validating an older file with the new file's metadata. Existing HDF5
+files are validated before being skipped. A transfer
+with no trustworthy total length is kept as a partial file and is not reported as
+successful. `validate=False` disables HDF5 validation, but transfer length checks
+still apply. `reprocess=True` starts a fresh transfer. Failed downloads are omitted
+from the returned list, so check its length when a complete set is required.
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO)  # Progress every 30 seconds
+fps = download_urls(track_77, "local/gslcs/", max_workers=2, retries=5, timeout=120)
+```
+
+Sidecars and downloader messages do not store download URLs or signed query
+strings. Authentication continues to use the standard Requests environment,
+including your NASA Earthdata credentials in `.netrc`.
 
 NISAR products are published at several processing maturities, which cover
 different date ranges rather than reprocessing the same acquisitions. Leaving
