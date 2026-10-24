@@ -7,6 +7,8 @@ Currently supported:
                                   [--output-dir ...] [--bbox ...]
                                   [--bbox-wgs84 ...]
     nisar_pytools info <h5> [--json]
+    nisar_pytools download-gslc-subset <url> --output <subset.h5>
+        --bbox-wgs84 WEST SOUTH EAST NORTH [--cache-dir ...]
 
 Subcommand: ``to-geotiff``
     Convert a NISAR HDF5 file (GUNW or GSLC) into one or more GeoTIFFs.
@@ -845,6 +847,54 @@ def cmd_info(args: argparse.Namespace) -> None:
         print(_format_info_text(info))
 
 
+def cmd_download_gslc_subset(args: argparse.Namespace) -> None:
+    """Download a derived GSLC subset through the shared range-cache API."""
+    from nisar_pytools.io.subset import SubsetError, download_gslc_subset
+
+    west, south, east, north = args.bbox_wgs84
+    if not (
+        np.isfinite(args.bbox_wgs84).all()
+        and -180 <= west < east <= 180
+        and -90 <= south < north <= 90
+    ):
+        raise SystemExit("--bbox-wgs84 requires WEST SOUTH EAST NORTH with valid increasing bounds")
+    output = Path(args.output).expanduser().resolve()
+    cache = (
+        Path(args.cache_dir).expanduser().resolve()
+        if args.cache_dir else output.parent / ".nisar_subset_cache"
+    )
+    prefix = Path(args.reuse_prefix_dir).expanduser().resolve() if args.reuse_prefix_dir else None
+    frequency = _normalize_freq(args.freq).removeprefix("frequency")
+    try:
+        report = download_gslc_subset(
+            args.url, output, (west, south, east, north),
+            cache_dir=cache,
+            reuse_prefix_dir=prefix,
+            frequency=frequency,
+            polarization=args.pol,
+            max_workers=args.max_workers,
+            expected_size=args.expected_size,
+            plan_only=args.plan_only,
+            progress=lambda message: log.info("%s", message),
+        )
+    except SubsetError as exc:
+        raise SystemExit(f"GSLC subset failed: {exc}") from None
+    except Exception as exc:  # noqa: BLE001 - suppress credentials in third-party errors
+        # A third-party HTTP error may contain an authenticated redirect URL.
+        raise SystemExit(
+            f"GSLC subset failed ({type(exc).__name__}); request details omitted. "
+            "Validated cached ranges are retained for retry."
+        ) from None
+    print(json.dumps(report, indent=2, default=str))
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 # ---------------------------------------------------------------------------
 # `rslc-to-gunw` subcommand
 # ---------------------------------------------------------------------------
@@ -888,6 +938,8 @@ Subcommands:
                 grids, coherence stats) for a GUNW or GSLC HDF5 file.
   rslc-to-gunw  Run nisar.workflows.insar on an RSLC pair and produce
                 a GUNW (requires the [isce3] optional dep group).
+  download-gslc-subset
+                Download a derived GSLC subset using persistent byte-range cache.
 
 Run `nisar_pytools <subcommand> --help` for subcommand-specific help.
 """
@@ -1146,6 +1198,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit JSON instead of formatted text. Numeric stats stay as floats.",
     )
     p_info.set_defaults(func=cmd_info)
+
+    p_subset = sub.add_parser(
+        "download-gslc-subset",
+        help="Download a derived GSLC subset without downloading the entire source granule.",
+        description=(
+            "Read the HDF5 chunks needed for a WGS84 bounding box using validated "
+            "HTTP ranges and a persistent cache. The output is a derived subset, "
+            "not a complete official NISAR granule. Repeating the same command "
+            "reuses validated cached ranges. Earthdata authentication uses .netrc."
+        ),
+    )
+    p_subset.add_argument("url", help="Original stable GSLC download URL.")
+    p_subset.add_argument(
+        "--output", required=True, metavar="SUBSET_H5",
+        help="Path for the derived subset HDF5 (for example, scene_derived_subset.h5).",
+    )
+    p_subset.add_argument(
+        "--bbox-wgs84", required=True, nargs=4, type=float,
+        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
+        help="Bounding box in WGS84 degrees, in WEST SOUTH EAST NORTH order.",
+    )
+    p_subset.add_argument(
+        "--cache-dir", metavar="DIR",
+        help="Persistent range cache. Default: .nisar_subset_cache beside the output.",
+    )
+    p_subset.add_argument(
+        "--reuse-prefix-dir", metavar="DIR",
+        help="Read existing whole-granule .part prefixes when their source validators match.",
+    )
+    p_subset.add_argument("--freq", default="A", help="Frequency A or B. Default: A.")
+    p_subset.add_argument(
+        "--pol", default="HH", choices=sorted(VALID_POLARIZATIONS),
+        help="Polarization to download. Default: HH.",
+    )
+    p_subset.add_argument(
+        "--max-workers", type=_positive_int, choices=range(1, 9), default=2,
+        help="Concurrent range requests per source, from 1 to 8. Default: 2.",
+    )
+    p_subset.add_argument(
+        "--expected-size", type=_positive_int, metavar="BYTES",
+        help="Optional exact source file size from the catalog, checked before extracting.",
+    )
+    p_subset.add_argument(
+        "--plan-only", action="store_true",
+        help="Read metadata and report the subset plan without exporting its pixel arrays.",
+    )
+    p_subset.set_defaults(func=cmd_download_gslc_subset)
 
     # rslc-to-gunw subcommand --------------------------------------------
     p_r2g = sub.add_parser(

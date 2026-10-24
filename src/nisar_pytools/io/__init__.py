@@ -16,10 +16,12 @@ from nisar_pytools.io.stream_rslc import (
     open_remote_rslc,
     write_skeleton,
 )
+from nisar_pytools.io.subset import download_gslc_subset
 
 __all__ = [
     "crop_streamed",
     "decode_echo",
+    "download_gslc_subset",
     "download_urls",
     "echo_path",
     "find_nisar",

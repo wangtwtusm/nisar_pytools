@@ -326,6 +326,55 @@ different date ranges rather than reprocessing the same acquisitions. Leaving
 `maturity` unset searches all of them and warns when results span more than
 one.
 
+### Download a GSLC subset
+
+Use `download_gslc_subset` to fetch one polarization and its validity layers
+inside a WGS84 bounding box. HTTP byte-range requests read the required HDF5
+chunks; the full source granule does not need to be downloaded. The resulting
+HDF5 is explicitly marked as a **derived subset**, with source provenance and
+cropped coordinates. It is not a complete official NISAR product.
+This path supports chunked LSAR GSLC layers on regular north-up grids and
+requires a server that provides HTTP Range responses and a strong ETag.
+Only selected identification, grid and direct processing/input/orbit metadata
+are retained; calibration and other ancillary metadata are omitted, with this
+scope recorded inside the file.
+
+```python
+from nisar_pytools import download_gslc_subset
+
+report = download_gslc_subset(
+    gslc_url,
+    "local/gslcs/scene_derived_subset.h5",
+    bbox=(92.9, 31.6, 94.7, 33.2),  # WEST, SOUTH, EAST, NORTH
+    cache_dir="local/gslcs/range_cache",
+    reuse_prefix_dir="local/gslcs",  # Optional existing whole-granule .part files
+    frequency="A",
+    polarization="HH",
+    max_workers=2,
+)
+```
+
+The same operation is available from the command line:
+
+```bash
+nisar_pytools download-gslc-subset "$GSLC_URL" \
+    --output local/gslcs/scene_derived_subset.h5 \
+    --bbox-wgs84 92.9 31.6 94.7 33.2 \
+    --cache-dir local/gslcs/range_cache \
+    --reuse-prefix-dir local/gslcs --freq A --pol HH
+```
+
+Repeat the command after an interruption to reuse verified cached ranges.
+Whole-granule partial downloads are read only when their recorded source and
+validator match the remote resource, and remain available for later resumption.
+Use `plan_only=True` or `--plan-only` to inspect the required chunks and transfer
+estimate before exporting. Planning reads HDF5 metadata, so it still uses the network. `expected_size` / `--expected-size` can additionally check an
+exact source byte count from the catalog. The cache verifies stored payloads
+before reuse; remote resource changes invalidate stale bytes. Use separate
+output/cache locations for concurrent independent calls. Source provenance
+may include a stable public URL, but credentials and signed query URLs are never
+persisted.
+
 ## Stack GSLCs into a time series
 
 ```python
